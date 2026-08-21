@@ -40,15 +40,15 @@ if [ -e "$CONF" ] || [ -L "$CONF" ]; then
 fi
 
 # --- install ----------------------------------------------------------------
-mkdir -p "$BIN"
+mkdir -p "$BIN" "$(dirname "$CONF")"   # ~/.config may not exist yet on a fresh machine
 if [ "$MODE" = symlink ]; then
-  ln -s "$REPO/bin/wt" "$BIN/wt"
-  ln -s "$REPO/config" "$CONF"
+  ln -s "$REPO/bin/wt" "$BIN/wt" || die "could not link $BIN/wt"
+  ln -s "$REPO/config" "$CONF"   || die "could not link $CONF"
   say "symlinked $BIN/wt and $CONF → this repo"
 else
-  install -m 755 "$REPO/bin/wt" "$BIN/wt"
+  install -m 755 "$REPO/bin/wt" "$BIN/wt" || die "could not install $BIN/wt"
   mkdir -p "$CONF"
-  cp -R "$REPO/config/." "$CONF/"
+  cp -R "$REPO/config/." "$CONF/" || die "could not copy into $CONF"
   say "copied into $BIN and $CONF"
 fi
 mkdir -p "$HOME/.local/state/wt/status"
