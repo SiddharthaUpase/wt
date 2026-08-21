@@ -377,13 +377,23 @@ cmd_doctor() {
          "ssh $host \"docker exec $cname tmux -L wt send-keys -t $name -X cancel\"" \
     || dx "inner copy-mode" ok "clear"
 
-  local cv; cv=$(dxg claudever)
+  local cv pc; cv=$(dxg claudever); pc=$(dxg pcmd)
   case "$cv" in
     *Claude*) dx "claude binary" ok "$cv" ;;
-    "") dx "claude binary" fail "claude does not run in the container" \
-          "docker exec -u dev $cname bash -lc 'npm i -g @anthropic-ai/claude-code --include=optional'" ;;
-    *) dx "claude binary" fail "$cv" \
-          "a self-update was interrupted; reinstall with --include=optional" ;;
+    *)
+      # A container still finishing `bun install` answers "command not found" from a
+      # login shell while claude is demonstrably running in its own pane. The pane is
+      # the stronger evidence, so trust it and do not cry FAIL at a booting session.
+      case "$pc" in
+        claude|*[0-9].[0-9]*)
+          dx "claude binary" ok "running in the pane ($pc) — still booting, login-shell probe not warm yet" ;;
+        "")
+          dx "claude binary" fail "claude does not run in the container" \
+             "docker exec -u dev $cname bash -lc 'npm i -g @anthropic-ai/claude-code --include=optional'" ;;
+        *)
+          dx "claude binary" fail "${cv:-not found}; pane is running '$pc'" \
+             "a self-update was interrupted; reinstall with --include=optional" ;;
+      esac ;;
   esac
 
   local h; h=$(dxg hooks)
