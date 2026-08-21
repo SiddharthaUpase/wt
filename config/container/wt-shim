@@ -1,0 +1,121 @@
+#!/bin/bash
+# `wt` inside a container. A container cannot reach the other sessions directly:
+# its tmux server holds only itself, and it has no route to the laptop or to its
+# sibling containers. So outbound work is written to a shared outbox on the host
+# and delivered by the hub's poller, which is already ssh-ing here every few
+# seconds for status. Same pattern, no new daemon, no host access from here.
+set -uo pipefail
+
+SHARED="$HOME/.local/state/wt"          # bind-mounted from the host
+OUTBOX="$SHARED/outbox"
+SESSIONS="$SHARED/sessions.json"
+ME="${WT_SESSION:-unknown}"
+
+die() { echo "$*" >&2; exit 1; }
+
+cmd_send() {
+  local to="${1:-}"; shift 2>/dev/null || true
+  local msg="$*"
+  [ -z "$to" ] || [ -z "$msg" ] && die "usage: wt send <session> <message>"
+  # Preferred drop point is the outbox. Containers created before the shared
+  # mount existed only have .../status — fall back to dropping there with a dot
+  # prefix, which the hub's status loop skips (glob ignores dotfiles) and its
+  # delivery loop picks up.
+  local f
+  if mkdir -p "$OUTBOX" 2>/dev/null; then
+    f="$OUTBOX/$(date +%s)-$$-$RANDOM.msg"
+  elif [ -d "$SHARED/status" ]; then
+    f="$SHARED/status/.msg-$(date +%s)-$$-$RANDOM"
+  else
+    die "no shared directory mounted — this container cannot send"
+  fi
+  {
+    printf 'to: %s\n' "$to"
+    printf 'from: %s\n' "$ME"
+    printf '\n%s\n' "$msg"
+  } > "$f.tmp" && mv "$f.tmp" "$f"
+  echo "queued for $to (delivered within a few seconds)"
+}
+
+cmd_ls() {
+  [ -f "$SESSIONS" ] || die "no session list yet — the hub publishes it every few seconds"
+  if [ "${1:-}" = --json ]; then cat "$SESSIONS"; return; fi
+  python3 - "$SESSIONS" <<'PY'
+import json,sys
+for s in json.load(open(sys.argv[1])):
+    print("%-8s %-38s %s" % (s.get("status","-"), s["name"], "cloud" if s.get("remote") else "local"))
+PY
+}
+
+# Spawning is laptop-side work (git push to the mirror, docker run, creating the
+# sidebar row), none of which a container can reach. So it goes through the same
+# outbox: the hub picks the request up and runs `wt cnew`, then messages back
+# with the new session's name.
+cmd_spawn() {
+  local branch=""
+  if [ "${1:-}" = --branch ]; then branch="${2:-}"; shift 2; fi
+  local task="$*"
+  [ -z "$task" ] && die "usage: wt spawn [--branch <name>] <task description>"
+  local f
+  if mkdir -p "$OUTBOX" 2>/dev/null; then
+    f="$OUTBOX/$(date +%s)-$$-$RANDOM.msg"
+  elif [ -d "$SHARED/status" ]; then
+    f="$SHARED/status/.msg-$(date +%s)-$$-$RANDOM"
+  else
+    die "no shared directory mounted — this container cannot spawn"
+  fi
+  {
+    printf 'cmd: spawn\n'
+    printf 'from: %s\n' "$ME"
+    [ -n "$branch" ] && printf 'branch: %s\n' "$branch"
+    printf '\n%s\n' "$task"
+  } > "$f.tmp" && mv "$f.tmp" "$f"
+  echo "spawn requested — the hub will create it and message you the name"
+}
+
+# Cloning is laptop-side work too (docker run, the sidebar row), so it takes the
+# same route as spawn. Default target is this session: "clone me".
+cmd_clone() {
+  local src="${1:-$ME}" new="${2:-}"
+  local f
+  if mkdir -p "$OUTBOX" 2>/dev/null; then
+    f="$OUTBOX/$(date +%s)-$$-$RANDOM.msg"
+  elif [ -d "$SHARED/status" ]; then
+    f="$SHARED/status/.msg-$(date +%s)-$$-$RANDOM"
+  else
+    die "no shared directory mounted — this container cannot clone"
+  fi
+  {
+    printf 'cmd: clone\n'
+    printf 'from: %s\n' "$ME"
+    printf 'target: %s\n' "$src"
+    [ -n "$new" ] && printf 'newname: %s\n' "$new"
+    printf '\n.\n'
+  } > "$f.tmp" && mv "$f.tmp" "$f"
+  echo "clone requested for '$src' — the hub will build it and message you the name"
+}
+
+cmd_whoami() { printf '%s\n' "$ME"; }
+
+sub="${1:-}"; [ $# -gt 0 ] && shift
+case "$sub" in
+  send)   cmd_send "$@" ;;
+  spawn)  cmd_spawn "$@" ;;
+  clone)  cmd_clone "$@" ;;
+  ls)     cmd_ls "$@" ;;
+  whoami) cmd_whoami ;;
+  *)
+    cat <<EOF
+wt (container) — you are '$ME', running in a container.
+
+  wt ls [--json]        sessions across the whole fleet (published by the hub)
+  wt send <name> <msg>  message another session, local or cloud
+  wt spawn <task>       create a NEW cloud session working on <task>
+  wt clone [name]       clone a session (default: you) — same work, new branch
+  wt whoami             this session's name
+
+Messages are queued and delivered by the hub within a few seconds. Peek and the
+session-management verbs are laptop-side only.
+EOF
+    exit 1 ;;
+esac

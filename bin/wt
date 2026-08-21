@@ -1,0 +1,907 @@
+#!/bin/bash
+# wt — worktree sessions with a static sidebar (tmux-native Superset replacement)
+#
+#   wt                  open the hub (sidebar + sessions) from any terminal;
+#                       if cwd is a git repo with no session, one is created for it
+#   wt doctor [name]    check a session end to end and name the broken link
+#   wt clone <name> [new]  clone a session: same work + conversation, new branch
+#   wt new <br> [base]  new worktree + branch off origin/<base> (default: origin/HEAD),
+#                       copy .env files, launch claude — one command, like `ca vm`
+#   wt here [name]      session for the current folder (no worktree)
+#   wt ls [--json]      list sessions with status (--json for the UI contract)
+#   wt attach-cmd <name>  print the command a terminal widget should run
+#   wt rm [-y] <name>   kill session + remove its worktree (branch kept)
+#   wt mv <old> <new>   rename a session (worktree dir + branch unchanged)
+#   wt scratch [name]   throwaway claude for random ideas (sidebar: t · hub: C-q t)
+#   wt browser [name] [url]  a Chromium session in a pane (sidebar: b)
+#   wt send [--from <who>] <name> <msg>  type a message into another session's claude
+#   wt peek <name>      show the last 40 lines of another session's screen
+#   wt busy <name>      exit 0 if the session is mid-turn (pane-based, not the status file)
+#   wt current          print the session the user is viewing right now
+#   wt key [F1-F8 [name|--clear]]  bind a session to an Fn key (peek/jump popup)
+#   wt orch [name]      alias for `wt key F2` — the orchestrator slot
+#   wt edit [name]      open a session's worktree in Cursor (default: current)
+#   wt open [name]      switch the user's hub view to a session (default: caller's)
+#   wt tell <msg>       message the session the user is viewing (no-op if that is the caller)
+#   wt push <name>      elevate a session to the VM (worktree + claude conversation)
+#   wt vmsync [repo]    sync claude config (CLAUDE.md, hooks, skills, memory) to the VM
+#   wt csetup [repo]    prepare a container host (dirs + wt-session image)
+#   wt cnew [-p task] <branch>  create a new session directly in the cloud
+#   wt cpush [--as <new>] <name>  elevate a session into its own capped container
+#                       (--as clones: the source keeps running locally)
+#   wt cpull [--keep] <name>  bring a container session back to the laptop
+#   wt crm <name>       tear down a session's container + dirs
+set -uo pipefail
+
+SOCK=wt
+HUB=wt-hub
+CONF="$HOME/.config/wt"
+STATE="$HOME/.local/state/wt/status"
+LAYOUT="$HOME/.local/state/wt/layout"
+ORCH="$HOME/.local/state/wt/orchestrator"
+DEFAULT_CMD='claude --dangerously-skip-permissions --chrome'
+
+it() { tmux -L "$SOCK" -f "$CONF/inner.conf" "$@"; }
+
+name_for() { printf '%s' "$1" | tr './:@ ' '-' | tr -s '-'; }
+
+# A single `send-keys -l` of a long string overruns the receiving TUI's input
+# handling: claude drops characters, or the shell sees a half-typed line. Type in
+# chunks with a beat between them so the receiver keeps up. Fixes long `wt send`
+# messages and the task prompts `wt new -p` hands over.
+type_into() {  # $1 target · $2 text
+  local t="$1" text="$2" i=0 n=${#2}
+  if [ "$n" -le 400 ]; then it send-keys -t "$t" -l "$text"; return; fi
+  while [ "$i" -lt "$n" ]; do
+    it send-keys -t "$t" -l "${text:$i:400}" || return 1
+    i=$((i + 400))
+    sleep 0.15
+  done
+}
+
+main_repo_of() { git -C "$1" worktree list 2>/dev/null | head -1 | awk '{print $1}'; }
+
+# caller's own session — the live tmux name survives `wt mv`; $WT_SESSION does not
+live_name() {
+  case "${TMUX:-}" in */wt,*) ;; *) return 1 ;; esac
+  tmux display-message -p '#S' 2>/dev/null
+}
+
+# point every inner client (i.e. the hub's right pane) at a session
+focus() {
+  local c
+  for c in $(it list-clients -F '#{client_name}' 2>/dev/null); do
+    it switch-client -c "$c" -t "=$1" 2>/dev/null
+  done
+}
+
+ensure_session_for_cwd() {
+  local root name
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  if it list-sessions -F '#{session_path}' 2>/dev/null | grep -qx "$root"; then return 0; fi
+  name=$(name_for "$(basename "$root")")
+  it has-session -t "=$name" 2>/dev/null && return 0
+  it new-session -d -s "$name" -c "$root" \
+     -e WT_SESSION="$name" -e WT_REPO="$(main_repo_of "$root")"
+}
+
+cmd_ui() {
+  if [ -n "${TMUX:-}" ]; then
+    echo "already inside tmux — open the hub from a plain terminal (or: wt ls)" >&2
+    exit 1
+  fi
+  ensure_session_for_cwd
+  if ! tmux -L "$HUB" has-session -t hub 2>/dev/null; then
+    tmux -L "$HUB" -f "$CONF/hub.conf" new-session -d -s hub \
+      -x "$(tput cols)" -y "$(tput lines)" "$CONF/sidebar.sh"
+    tmux -L "$HUB" split-window -h -t hub "$CONF/attach.sh"
+    local left w
+    left=$(tmux -L "$HUB" list-panes -t hub -F '#{pane_id}' | head -1)
+    w=$(cat "$HOME/.local/state/wt/sidebar-width" 2>/dev/null || echo 28)
+    tmux -L "$HUB" resize-pane -t "$left" -x "$w"
+    tmux -L "$HUB" set-hook -g client-resized \
+      "run-shell '$HOME/.config/wt/fix-width.sh $left'" 2>/dev/null || true
+  else
+    # self-heal: restore a pane that died (e.g. stray Ctrl-C in the sidebar)
+    local panes
+    panes=$(tmux -L "$HUB" list-panes -t hub -F '#{pane_start_command}' 2>/dev/null)
+    if ! echo "$panes" | grep -q sidebar; then
+      tmux -L "$HUB" split-window -hb -t hub "$CONF/sidebar.sh"
+      local left w
+      left=$(tmux -L "$HUB" list-panes -t hub -F '#{pane_id} #{pane_start_command}' | grep sidebar | awk '{print $1}')
+      w=$(cat "$HOME/.local/state/wt/sidebar-width" 2>/dev/null || echo 28)
+      tmux -L "$HUB" resize-pane -t "$left" -x "$w"
+      tmux -L "$HUB" set-hook -g client-resized \
+        "run-shell '$HOME/.config/wt/fix-width.sh $left'" 2>/dev/null || true
+    fi
+    if ! echo "$panes" | grep -q attach; then
+      tmux -L "$HUB" split-window -h -t hub "$CONF/attach.sh"
+    fi
+  fi
+  exec tmux -L "$HUB" attach -t hub
+}
+
+# branch names are a random city + object, not a summary of the task: task text
+# makes long, near-duplicate branches, while "you/lisbon-anchor" stays short and
+# is easy to say out loud. The task itself is in the session, not the branch.
+CITIES="lisbon osaka nairobi quito bergen kyoto porto lima dakar hobart tallinn
+gdansk seville tbilisi bruges cusco naples utrecht galway pisa cadiz sapporo
+valencia bologna cork bilbao ghent aarhus split zadar kotor nantes leiden
+turku odense malmo bristol tromso ravenna verona siena mostar batumi"
+OBJECTS="anchor lantern compass ember quill harbor beacon kettle sextant lattice
+prism satchel bellows anvil cairn thistle marlin cobble spindle tundra falcon
+obsidian juniper cinder mosaic ledger trellis gantry pennant harrow"
+
+cmd_slug() {
+  local city obj s n i prefix
+  # who the branch belongs to: git config wt.prefix, else the login name
+  prefix=$(git config --get wt.prefix 2>/dev/null || true)
+  prefix="${prefix:-${USER:-dev}}"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    city=$(printf '%s\n' $CITIES | sed -n "$(( RANDOM % $(printf '%s\n' $CITIES | wc -l) + 1 ))p")
+    obj=$(printf '%s\n' $OBJECTS | sed -n "$(( RANDOM % $(printf '%s\n' $OBJECTS | wc -l) + 1 ))p")
+    s="${prefix}/${city}-${obj}"
+    n=$(name_for "$s")
+    it has-session -t "=$n" 2>/dev/null || { printf '%s\n' "$s"; return 0; }
+  done
+  printf '%s/%s-%s\n' "$prefix" "$city" "$(date +%H%M%S)"
+}
+
+# Clone a session: same code, same uncommitted work, same conversation, but a new
+# branch and a new claude. Use it to try a second approach without losing the
+# first. A cloud session is cloned in the cloud (see wt-container.sh).
+cmd_clone() {
+  local src="${1:-}" new="${2:-}"
+  [ -z "$src" ] && { echo "usage: wt clone <session> [newname]" >&2; exit 1; }
+  it has-session -t "=$src" 2>/dev/null || { echo "no session '$src' (see: wt ls)" >&2; exit 1; }
+
+  if [ -f "$HOME/.local/state/wt/vm/$src" ]; then
+    exec "$CONF/wt-container.sh" cclone "$src" "$new"
+  fi
+
+  local dir repo branch root
+  dir=$(it list-sessions -F '#{session_name}|#{session_path}' 2>/dev/null \
+        | awk -F'|' -v n="$src" '$1==n{print $2}')
+  [ -f "$dir/.git" ] || { echo "'$src' is not a worktree session — nothing to clone" >&2; exit 1; }
+  repo=$(main_repo_of "$dir")
+  branch=$(git -C "$dir" branch --show-current)
+  [ -z "$branch" ] && { echo "detached HEAD in $dir — check out a branch first" >&2; exit 1; }
+
+  # default name: <source>-2, -3, ... so a clone is recognisably a clone
+  if [ -z "$new" ]; then
+    local i
+    for i in 2 3 4 5 6 7 8 9; do
+      it has-session -t "=${src}-$i" 2>/dev/null || { new="${src}-$i"; break; }
+    done
+  fi
+  [ -z "$new" ] && { echo "'$src' already has 8 clones — name this one: wt clone $src <name>" >&2; exit 1; }
+  new=$(name_for "$new")
+  it has-session -t "=$new" 2>/dev/null && { echo "session '$new' already exists" >&2; exit 1; }
+
+  root=$(git -C "$repo" config wt.root 2>/dev/null || true)
+  [ -z "$root" ] && root="$HOME/worktrees/$(basename "$repo")"
+  local newdir="$root/$new" newbranch="${branch}-clone-$(date +%H%M%S)"
+  [ -e "$newdir" ] && { echo "$newdir already exists" >&2; exit 1; }
+
+  echo "→ new worktree $newdir (branch $newbranch off $branch)"
+  mkdir -p "$root"
+  git -C "$repo" worktree add -q -b "$newbranch" "$newdir" "$branch" || exit 1
+
+  echo "→ copying uncommitted work (.env included)"
+  local flist n=0; flist=$(mktemp /tmp/wt-clone.XXXXXX)
+  { git -C "$dir" ls-files -mo --exclude-standard
+    git -C "$dir" ls-files --others --ignored --exclude-standard | grep -E '(^|/)\.env[^/]*$'
+  } | sort -u > "$flist"
+  if [ -s "$flist" ]; then
+    rsync -aq --files-from="$flist" "$dir/" "$newdir/" && n=$(wc -l < "$flist" | tr -d ' ')
+  fi
+  rm -f "$flist"
+  echo "  $n file(s)"
+
+  # share node_modules rather than reinstalling — it is the slow part
+  [ -e "$dir/node_modules" ] && [ ! -e "$newdir/node_modules" ] \
+    && ln -s "$dir/node_modules" "$newdir/node_modules" 2>/dev/null
+
+  local pdir jf sid=""
+  pdir="$HOME/.claude/projects/$(printf '%s' "$dir" | sed 's|[/.]|-|g')"
+  jf=$(ls -t "$pdir"/*.jsonl 2>/dev/null | head -1)
+  if [ -n "$jf" ]; then
+    sid=$(basename "$jf" .jsonl)
+    local npdir="$HOME/.claude/projects/$(printf '%s' "$newdir" | sed 's|[/.]|-|g')"
+    mkdir -p "$npdir"
+    # a live source is mid-append; drop a trailing partial record or resume fails
+    python3 - "$jf" "$npdir/$sid.jsonl" <<'PY'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+good = []
+for line in open(src, encoding='utf-8', errors='replace'):
+    if not line.strip():
+        continue
+    try:
+        json.loads(line)
+    except Exception:
+        break
+    good.append(line if line.endswith('\n') else line + '\n')
+open(dst, 'w', encoding='utf-8').writelines(good)
+print(f"  conversation copied ({len(good)} records)")
+PY
+  else
+    echo "  no conversation to copy — the clone starts fresh"
+  fi
+
+  it new-session -d -s "$new" -c "$newdir" \
+     -e WT_SESSION="$new" -e WT_REPO="$repo" -e WT_BRANCH="$newbranch"
+  it rename-window -t "=$new:^" claude
+  local cmd; cmd=$(git -C "$repo" config wt.cmd 2>/dev/null || true)
+  [ -z "$cmd" ] && cmd="$DEFAULT_CMD"
+  it send-keys -t "=$new:claude" "$cmd${sid:+ --resume $sid}" Enter
+  layout_add_after "$new" "$src"
+  # deliberately no focus(): a clone appears in the sidebar under its source and
+  # the user moves to it when they choose to
+  echo "✓ '$new' cloned from '$src'${sid:+ (same conversation)} — both run independently"
+  return 0
+}
+
+# `wt doctor` — name the broken link instead of guessing.
+#
+# Written after the 2026-08-20 outage, where every failure mode looked identical
+# from the sidebar: ssh reachability, an empty settings.json, a corrupted claude
+# install, an inner tmux stuck in copy-mode and a host out of memory all present
+# as "the session is dead". An hour went into ruling out the wrong ones, and the
+# wrong first guess triggered a hard reset that corrupted a claude install.
+# Modelled on `fleet doctor`, which turned browser setup into a ten-minute job.
+DX_OK=0; DX_BAD=0
+dx() {  # $1 label · $2 ok|warn|fail · $3 detail · $4 fix hint
+  local c e
+  case "$2" in
+    ok)   c=$'\e[32m'; e="ok  " ;;
+    warn) c=$'\e[33m'; e="WARN" ;;
+    *)    c=$'\e[31m'; e="FAIL" ;;
+  esac
+  [ "$2" = ok ] && DX_OK=$((DX_OK+1)) || DX_BAD=$((DX_BAD+1))
+  printf '  %s%s%s  %-20s %s\n' "$c" "$e" $'\e[0m' "$1" "$3"
+  [ "$2" != ok ] && [ -n "${4:-}" ] && printf '        %s↳ %s%s\n' $'\e[2m' "$4" $'\e[0m'
+  return 0
+}
+
+dxg() { printf '%s\n' "$DX_R" | sed -n "s/^$1=//p" | head -1; }
+
+cmd_doctor() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then cmd_doctor_fleet; return $?; fi
+  it has-session -t "=$name" 2>/dev/null || { echo "no session '$name' (see: wt ls)" >&2; exit 1; }
+
+  printf '\n%s%s%s\n' $'\e[1m' "$name" $'\e[0m'
+  local mark="$HOME/.local/state/wt/vm/$name" dir
+  dir=$(it list-sessions -F '#{session_name}|#{session_path}' 2>/dev/null \
+        | awk -F'|' -v n="$name" '$1==n{print $2}')
+
+  # --- what the laptop can see on its own -------------------------------
+  local pcmd
+  pcmd=$(it list-panes -t "=$name" -F '#{pane_current_command}' 2>/dev/null | head -1)
+  if [ -f "$mark" ]; then
+    # a cloud row's local pane should hold the attach loop. A bare shell means the
+    # loop exited, so the user is staring at a prompt and assumes the session died.
+    case "$pcmd" in
+      ssh|*vm-attach*|sshd) dx "local pane" ok "attached ($pcmd)" ;;
+      *) dx "local pane" warn "shows '$pcmd', not the attach loop — the pane fell back to a shell" \
+           "re-attach it: wt open $name, or run $CONF/vm-attach.sh $name in that pane" ;;
+    esac
+  else
+    dx "local pane" ok "running: ${pcmd:-none}"
+  fi
+  local pmode
+  pmode=$(it list-panes -t "=$name" -F '#{pane_in_mode}' 2>/dev/null | head -1)
+  [ "${pmode:-0}" = 1 ] \
+    && dx "local copy-mode" fail "the local pane is in copy-mode and eats keys" \
+         "press q in that pane, or: tmux -L wt send-keys -t '=$name' -X cancel" \
+    || dx "local copy-mode" ok "clear"
+
+  local st age=""
+  st=$(cat "$STATE/$name" 2>/dev/null)
+  if [ -f "$STATE/$name" ]; then
+    age=$(( $(date +%s) - $(stat -f %m "$STATE/$name" 2>/dev/null || echo 0) ))
+  fi
+  if [ -z "$st" ]; then
+    dx "status hook" fail "no status file — the sidebar will show '-' forever" \
+       "settings.json in this session has no hooks; see the settings check below"
+  elif [ "$st" = running ] && [ "${age:-0}" -gt 120 ] && ! cmd_busy "$name" >/dev/null 2>&1; then
+    dx "status hook" warn "says 'running' but the pane is idle (${age}s stale)" \
+       "a turn ended without a Stop event; the sidebar self-heals after 45s"
+  elif [ "${age:-0}" -gt 86400 ]; then
+    dx "status hook" ok "$st (last change $(( age / 86400 ))d ago — session is dormant)"
+  else
+    dx "status hook" ok "$st (${age}s ago)"
+  fi
+
+  if [ ! -f "$mark" ]; then
+    # --- local session ---------------------------------------------------
+    dx "location" ok "local — $dir"
+    [ -n "$dir" ] && { [ -d "$dir" ] \
+      && dx "worktree" ok "present" \
+      || dx "worktree" fail "$dir is gone" "wt rm $name, then recreate it"; }
+    case "$pcmd" in
+      *claude*|[0-9]*) dx "claude" ok "alive" ;;
+      *) dx "claude" warn "pane is running '$pcmd', not claude" \
+           "it may have exited; restart it in that pane" ;;
+    esac
+    dx_summary; return 0
+  fi
+
+  # --- cloud session ----------------------------------------------------
+  local host cname
+  host=$(head -1 "$mark" 2>/dev/null); cname=$(sed -n 2p "$mark" 2>/dev/null)
+  dx "location" ok "cloud — $cname on $host"
+
+  local t0 probe rtt
+  t0=$(date +%s)
+  probe=$(ssh -n -o ConnectTimeout=12 -o BatchMode=yes "$host" 'echo SSHOK' 2>&1 | tail -1)
+  rtt=$(( $(date +%s) - t0 ))
+  if [ "$probe" != SSHOK ]; then
+    dx "ssh to $host" fail "unreachable: $probe" \
+       "if it times out rather than refuses, the port is being dropped in transit — the ssh config can route via IAP instead"
+    dx_summary; return 1
+  fi
+  dx "ssh to $host" ok "reachable (${rtt}s)"
+
+  # one round trip for everything inside the box
+  local R
+  R=$(ssh -n -o ConnectTimeout=15 -o BatchMode=yes "$host" "
+    C=$cname; N=$name
+    docker inspect -f '{{.State.Running}}' \$C >/dev/null 2>&1 && echo container=\$(docker inspect -f '{{.State.Running}}' \$C) || echo container=missing
+    echo restarts=\$(docker inspect -f '{{.RestartCount}}' \$C 2>/dev/null)
+    docker exec \$C tmux -L wt has-session -t \"=\$N\" >/dev/null 2>&1 && echo tmux=yes || echo tmux=no
+    echo mode=\$(docker exec \$C tmux -L wt list-panes -t \"\$N\" -F '#{pane_in_mode}' 2>/dev/null | head -1)
+    echo pcmd=\$(docker exec \$C tmux -L wt list-panes -t \"\$N\" -F '#{pane_current_command}' 2>/dev/null | head -1)
+    echo claudever=\$(docker exec \$C bash -lc 'claude --version 2>&1 | head -1' 2>/dev/null)
+    echo hooks=\$(docker exec \$C python3 -c 'import json;print(len(json.load(open(\"/state/claude/settings.json\")).get(\"hooks\",{})))' 2>/dev/null)
+    echo peak=\$(docker exec \$C cat /sys/fs/cgroup/memory.peak 2>/dev/null)
+    echo cap=\$(docker inspect -f '{{.HostConfig.Memory}}' \$C 2>/dev/null)
+    echo hostfree=\$(free -m | awk 'NR==2{print \$7}')
+    echo hosttotal=\$(free -m | awk 'NR==2{print \$2}')
+    echo caps=\$(docker ps -q | xargs -r docker inspect -f '{{.HostConfig.Memory}}' | awk '{s+=\$1} END{print s}')
+  " 2>/dev/null)
+  DX_R="$R"
+
+  [ "$(dxg container)" = true ] \
+    && dx "container" ok "running (restarts: $(dxg restarts))" \
+    || dx "container" fail "not running: $(dxg container)" "wt cpull $name to rescue the work, or wt crm $name"
+
+  [ "$(dxg tmux)" = yes ] \
+    && dx "inner tmux" ok "session exists" \
+    || dx "inner tmux" fail "no tmux session inside the container" "restart it: docker exec $cname tmux -L wt new-session -d -s $name"
+
+  # the invisible one: the LOCAL pane reads fine while the container's eats keys
+  [ "$(dxg mode)" = 1 ] \
+    && dx "inner copy-mode" fail "container pane is in copy-mode — it silently eats every keystroke" \
+         "ssh $host \"docker exec $cname tmux -L wt send-keys -t $name -X cancel\"" \
+    || dx "inner copy-mode" ok "clear"
+
+  local cv; cv=$(dxg claudever)
+  case "$cv" in
+    *Claude*) dx "claude binary" ok "$cv" ;;
+    "") dx "claude binary" fail "claude does not run in the container" \
+          "docker exec -u dev $cname bash -lc 'npm i -g @anthropic-ai/claude-code --include=optional'" ;;
+    *) dx "claude binary" fail "$cv" \
+          "a self-update was interrupted; reinstall with --include=optional" ;;
+  esac
+
+  local h; h=$(dxg hooks)
+  if [ -z "$h" ] || [ "$h" = 0 ]; then
+    dx "settings.json" fail "no hooks — this session can never report status" \
+       "regenerate it; wt cnew now refuses to build a container without hooks"
+  else
+    dx "settings.json" ok "$h hook events"
+  fi
+
+  local peak cap
+  peak=$(dxg peak); cap=$(dxg cap)
+  if [ -n "$peak" ] && [ -n "$cap" ] && [ "$cap" -gt 0 ] 2>/dev/null; then
+    dx "memory" ok "peak $(( peak / 1048576 ))MB of $(( cap / 1048576 ))MB cap"
+  fi
+
+  local free total caps
+  free=$(dxg hostfree); total=$(dxg hosttotal); caps=$(dxg caps)
+  if [ -n "$total" ] && [ -n "$caps" ] && [ "$total" -gt 0 ] 2>/dev/null; then
+    local capsmb=$(( caps / 1048576 ))
+    if [ "$capsmb" -gt "$total" ]; then
+      dx "host headroom" warn "${free}MB free of ${total}MB; container caps total ${capsmb}MB — overcommitted" \
+         "one runaway session can take the host down; lower wt.cmem or cap concurrency"
+    else
+      dx "host headroom" ok "${free}MB free of ${total}MB"
+    fi
+  fi
+  dx_summary
+}
+
+dx_summary() {
+  if [ "$DX_BAD" -eq 0 ]; then
+    printf '\n  %s%d checks passed, nothing wrong%s\n\n' $'\e[32m' "$DX_OK" $'\e[0m'
+  else
+    printf '\n  %s%d problem(s)%s, %d ok\n\n' $'\e[31m' "$DX_BAD" $'\e[0m' "$DX_OK"
+  fi
+}
+
+# no argument: sweep the fleet and print only the sessions with something wrong
+cmd_doctor_fleet() {
+  local n bad=0
+  echo "checking every session — only problems are shown"
+  while read -r n; do
+    [ -z "$n" ] && continue
+    DX_OK=0; DX_BAD=0
+    local out; out=$(cmd_doctor "$n" 2>&1)
+    if [ "$DX_BAD" -gt 0 ] || printf '%s' "$out" | grep -q 'FAIL\|WARN'; then
+      printf '%s\n' "$out"; bad=$((bad+1))
+    fi
+  done < <(it list-sessions -F '#{session_name}' 2>/dev/null | sort)
+  # note: every ssh in cmd_doctor uses -n; without it ssh drains this loop's stdin
+  [ "$bad" -eq 0 ] && printf '\n  %severy session is healthy%s\n\n' $'\e[32m' $'\e[0m'
+  return 0
+}
+
+cmd_new() {
+  local repo="" no_ui=0 branch="" base="" prompt=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-ui) no_ui=1 ;;
+      -r) repo="$2"; shift ;;
+      -p) prompt="$2"; shift ;;
+      *) if [ -z "$branch" ]; then branch="$1"; elif [ -z "$base" ]; then base="$1"; fi ;;
+    esac
+    shift
+  done
+  [ -z "$branch" ] && { echo "usage: wt new [-r repo] <branch> [base]" >&2; exit 1; }
+
+  if [ -z "$repo" ]; then
+    repo=$(git rev-parse --show-toplevel 2>/dev/null) \
+      || { echo "not inside a git repo — use: wt new -r <repo-path> <branch>" >&2; exit 1; }
+  fi
+  repo=$(main_repo_of "$repo")
+
+  local name; name=$(name_for "$branch")
+  it has-session -t "=$name" 2>/dev/null && { echo "session '$name' already exists" >&2; exit 1; }
+
+  local root; root=$(git -C "$repo" config wt.root 2>/dev/null || true)
+  [ -z "$root" ] && root="$HOME/worktrees/$(basename "$repo")"
+  local dir="$root/$name"
+  [ -e "$dir" ] && { echo "$dir already exists" >&2; exit 1; }
+
+  if [ -z "$base" ]; then
+    base=$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+    [ -z "$base" ] && base=main
+  fi
+  echo "→ fetching origin/$base"
+  git -C "$repo" fetch origin "$base" --quiet 2>/dev/null || echo "  (fetch failed — using local $base)"
+  local start="origin/$base"
+  git -C "$repo" rev-parse --verify -q "$start" >/dev/null || start="$base"
+
+  echo "→ worktree $dir  (branch $branch off $start)"
+  mkdir -p "$root"
+  git -C "$repo" worktree add -b "$branch" "$dir" "$start" >/dev/null || exit 1
+
+  local n=0 f
+  while IFS= read -r f; do
+    mkdir -p "$dir/$(dirname "$f")"
+    cp "$repo/$f" "$dir/$f" && n=$((n+1))
+  done < <(git -C "$repo" ls-files --others --ignored --exclude-standard 2>/dev/null \
+           | grep -E '(^|/)\.env[^/]*$')
+  echo "→ copied $n env file(s)"
+
+  [ -x "$repo/.wt/setup.sh" ] && { echo "→ running .wt/setup.sh"; (cd "$dir" && "$repo/.wt/setup.sh"); }
+
+  local cmd; cmd=$(git -C "$repo" config wt.cmd 2>/dev/null || true)
+  [ -z "$cmd" ] && cmd="$DEFAULT_CMD"
+
+  it new-session -d -s "$name" -c "$dir" \
+     -e WT_SESSION="$name" -e WT_REPO="$repo" -e WT_BRANCH="$branch"
+  it rename-window -t "=$name:^" claude
+  # The prompt is NOT appended to the command line. Shell-quoting a long,
+  # multi-line task produced a literal $'...\n...' that zsh printed and never
+  # ran, so claude never started. Boot bare, then type the task in once the TUI
+  # is up — the same way cnew does it for containers.
+  it send-keys -t "=$name:^" "$cmd" Enter
+  echo "→ session '$name': $cmd"
+  if [ -n "$prompt" ]; then
+    ( for _ in $(seq 1 40); do
+        sleep 2
+        it capture-pane -t "=$name:^" -p 2>/dev/null \
+          | grep -q 'bypass permissions on' && { "$0" send "$name" "$prompt"; exit 0; }
+      done ) >/dev/null 2>&1 &
+    echo "  task will be typed in once claude is up"
+  fi
+
+  # Spawning must NOT move the user's view. The only exception is the plain
+  # terminal path below, where we are opening the hub for them anyway and
+  # landing on the session they just asked for is the point.
+  if [ "$no_ui" -eq 0 ] && [ -z "${TMUX:-}" ]; then focus "$name"; exec "$0" ui; fi
+}
+
+cmd_rm() {
+  local yes=0 force=0 name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in -y) yes=1 ;; --force) force=1 ;; *) name="$1" ;; esac
+    shift
+  done
+  [ -z "$name" ] && { echo "usage: wt rm [-y] [--force] <session>" >&2; exit 1; }
+  local dir
+  dir=$(it list-sessions -F '#{session_name}|#{session_path}' 2>/dev/null \
+        | awk -F'|' -v n="$name" '$1==n{print $2}')
+  # dirty gate BEFORE touching anything (untracked .env copies don't count)
+  if [ "$force" -eq 0 ] && [ -n "$dir" ] && [ -f "$dir/.git" ]; then
+    local dirty
+    dirty=$(git -C "$dir" status --porcelain 2>/dev/null \
+            | grep -vE '^\?\? (.*/)?\.env[^/]*$' | head -1)
+    if [ -n "$dirty" ]; then
+      echo "worktree has uncommitted changes — nothing removed (wt rm --force $name discards them)" >&2
+      exit 1
+    fi
+  fi
+  if [ "$yes" -eq 0 ]; then
+    printf "kill session '%s'%s? [y/N] " "$name" "${dir:+ and remove worktree $dir}"
+    read -r a; [ "$a" = y ] || exit 0
+  fi
+  it kill-session -t "=$name" 2>/dev/null
+  rm -f "$STATE/$name"
+  if [ -n "$dir" ] && [ -f "$dir/.git" ]; then   # linked worktrees have a .git FILE
+    local repo; repo=$(main_repo_of "$dir")
+    git -C "$repo" worktree remove --force "$dir" \
+      && echo "removed worktree $dir (branch kept)"
+  fi
+}
+
+cmd_mv() {
+  local old="${1:-}" new="${2:-}"
+  if [ -z "$old" ] || [ -z "$new" ]; then
+    echo "usage: wt mv <old> <new>" >&2; exit 1
+  fi
+  new=$(name_for "$new")
+  it has-session -t "=$old" 2>/dev/null || { echo "no session '$old' (see: wt ls)" >&2; exit 1; }
+  it has-session -t "=$new" 2>/dev/null && { echo "session '$new' already exists" >&2; exit 1; }
+  it rename-session -t "=$old" "$new" || exit 1
+  # future panes/windows see the new name; already-running processes keep the
+  # old env, which is why hooks.sh resolves the live name from tmux instead
+  it set-environment -t "=$new" WT_SESSION "$new" 2>/dev/null
+  [ -f "$STATE/$old" ] && mv "$STATE/$old" "$STATE/$new"
+  if [ -f "$LAYOUT" ]; then   # keep the session's sidebar group across the rename
+    awk -v o="$old" -v n="$new" '$0==o{$0=n}1' "$LAYOUT" > "$LAYOUT.tmp" \
+      && mv "$LAYOUT.tmp" "$LAYOUT"
+  fi
+  echo "renamed '$old' → '$new' (worktree dir + branch unchanged)"
+}
+
+# Machine-readable session list — the contract the Tauri UI reads. Includes
+# `host` even though there is one container host today, so adding a pool later
+# needs no UI change. Everything the UI needs is here: it never has to know
+# whether a session is local or remote.
+cmd_ls_json() {
+  local n p w st key kf host cname mark first=1
+  printf '[\n'
+  while IFS='|' read -r n p w; do
+    st=$(cat "$STATE/$n" 2>/dev/null || echo new)
+    mark="$HOME/.local/state/wt/vm/$n"
+    host=""; cname=""
+    if [ -f "$mark" ]; then host=$(head -1 "$mark"); cname=$(sed -n 2p "$mark"); fi
+    key=""
+    for kf in "$HOME/.local/state/wt/keys"/F[1-8]; do
+      [ -f "$kf" ] && [ "$(cat "$kf")" = "$n" ] && { key="${kf##*/}"; break; }
+    done
+    [ "$first" -eq 0 ] && printf ',\n'; first=0
+    printf '  {"name":"%s","path":"%s","windows":%s,"status":"%s","remote":%s,"host":"%s","container":"%s","key":"%s"}' \
+      "$n" "$p" "${w:-1}" "$st" "$([ -n "$host" ] && echo true || echo false)" "$host" "$cname" "$key"
+  done < <(it list-sessions -F '#{session_name}|#{session_path}|#{session_windows}' 2>/dev/null | sort)
+  printf '\n]\n'
+}
+
+# The exact command a terminal widget should run to show this session. Hides the
+# local-vs-container difference entirely.
+cmd_attach_cmd() {
+  local n="${1:-}"
+  [ -z "$n" ] && { echo "usage: wt attach-cmd <session>" >&2; return 1; }
+  local mark="$HOME/.local/state/wt/vm/$n"
+  if [ -f "$mark" ]; then
+    local host cname; host=$(head -1 "$mark"); cname=$(sed -n 2p "$mark")
+    if [ -n "$cname" ]; then
+      printf 'ssh -t %s docker exec -it %s tmux -L wt attach -t =%s\n' "$host" "$cname" "$n"
+    else
+      printf 'ssh -t %s tmux -L wt attach -t =%s\n' "$host" "$n"
+    fi
+  else
+    it has-session -t "=$n" 2>/dev/null || { echo "no session '$n'" >&2; return 1; }
+    printf 'tmux -L %s -f %s attach -t =%s\n' "$SOCK" "$CONF/inner.conf" "$n"
+  fi
+}
+
+cmd_ls() {
+  it list-sessions -F '#{session_name}|#{session_path}|#{session_windows}' 2>/dev/null | sort \
+  | while IFS='|' read -r n p w; do
+      printf '%-8s %-30s %sw  %s\n' "$(cat "$STATE/$n" 2>/dev/null || echo -)" "$n" "$w" "$p"
+    done
+}
+
+# prefer the window named 'claude' in the target session, else its active pane
+send_target() {
+  # note: pane-level commands (send-keys/capture-pane) reject the '=name' exact
+  # syntax that session-level commands accept — use the bare name here
+  local t="$1"
+  it list-windows -t "=$1" -F '#{window_name}' 2>/dev/null | grep -qx claude && t="$1:claude"
+  printf '%s' "$t"
+}
+
+pane_runs_claude() {   # $1 = tmux target
+  # VM-elevated sessions show ssh locally; claude runs inside the VM tmux
+  [ -f "$HOME/.local/state/wt/vm/${1%%:*}" ] && return 0
+  local tty
+  tty=$(it list-panes -t "$1" -F '#{pane_active} #{pane_tty}' 2>/dev/null \
+        | awk '$1==1{print $2; exit}')
+  [ -n "$tty" ] || return 1
+  ps -o comm= -t "${tty#/dev/}" 2>/dev/null | grep -q claude
+}
+
+cmd_send() {
+  # --from lets a relay attribute a message to its true origin. Without it the
+  # live-tmux lookup below would stamp every relayed message with the relaying
+  # session's name instead of the container that actually sent it.
+  local override=""
+  if [ "${1:-}" = --from ]; then override="${2:-}"; shift 2; fi
+  local target="${1:-}"; [ $# -gt 0 ] && shift
+  local msg="$*"
+  if [ -z "$target" ] || [ -z "$msg" ]; then
+    echo "usage: wt send <session> <message>" >&2; exit 1
+  fi
+  it has-session -t "=$target" 2>/dev/null || { echo "no session '$target' (see: wt ls)" >&2; exit 1; }
+  local t; t=$(send_target "$target")
+  pane_runs_claude "$t" || { echo "'$target' is not running claude — refusing to type into its shell" >&2; exit 1; }
+  # live tmux name survives renames; the WT_SESSION env baked at spawn does not
+  local from="${override:-${WT_SESSION:-cli}}"
+  if [ -z "$override" ] && [ -n "${WT_SESSION:-}" ] && [ -n "${TMUX:-}" ]; then
+    from=$(tmux display-message -p '#S' 2>/dev/null)
+    [ -z "$from" ] && from="$WT_SESSION"
+  fi
+  local full="[from: $from] $msg"
+  local snip="${full:0:20}"
+  type_into "$t" "$full" \
+    || { echo "delivery to '$target' failed" >&2; exit 1; }
+  sleep 1
+  # a booting/redrawing TUI can eat typed input — verify it's in the box, retry once.
+  # claude COLLAPSES a long paste to "paste again to expand" instead of echoing it,
+  # so a snippet check alone made every long message get typed twice.
+  if ! it capture-pane -t "$t" -p | grep -qEF -e "$snip" -e 'paste again to expand'; then
+    it send-keys -t "$t" C-u
+    sleep 1
+    type_into "$t" "$full"
+    sleep 1
+  fi
+  it send-keys -t "$t" Enter
+  echo "sent to $target"
+}
+
+# Is this session mid-turn? The status file lies: it is written by hooks, and a
+# turn that ends without a Stop event (interrupt, crash, subagent teardown)
+# leaves it stuck on "running". The pane footer is authoritative — claude shows
+# "esc to interrupt" only while it is actually working.
+# Exit 0 = busy, 1 = idle.
+cmd_busy() {
+  local target="${1:-}"
+  [ -z "$target" ] && { echo "usage: wt busy <session>" >&2; exit 2; }
+  it has-session -t "=$target" 2>/dev/null || exit 1
+  it capture-pane -t "$(send_target "$target")" -p 2>/dev/null \
+    | grep -qE 'esc to inter'
+}
+
+cmd_peek() {
+  local target="${1:-}"
+  [ -z "$target" ] && { echo "usage: wt peek <session>" >&2; exit 1; }
+  it has-session -t "=$target" 2>/dev/null || { echo "no session '$target' (see: wt ls)" >&2; exit 1; }
+  it capture-pane -t "$(send_target "$target")" -p | grep -v '^[[:space:]]*$' | tail -40
+}
+
+# where the user is: the inner client with the most recent input activity
+# (covers the hub's right pane, pop-out popups, and plain-terminal attaches)
+cmd_current() {
+  local s
+  s=$(it list-clients -F '#{client_activity}|#{client_session}' 2>/dev/null \
+      | sort -t'|' -k1,1 -rn | head -1 | cut -d'|' -f2)
+  [ -z "$s" ] && { echo "no attached client — hub not open" >&2; return 1; }
+  printf '%s\n' "$s"
+}
+
+# open a session's worktree in Cursor (the `cursor` CLI isn't installed here,
+# so drive the app bundle). Default target is whatever the user is viewing.
+cmd_edit() {
+  local name="${1:-}"
+  [ -z "$name" ] && name=$(cmd_current) || true
+  [ -z "$name" ] && { echo "no session to open" >&2; return 1; }
+  local dir
+  dir=$(it list-sessions -F '#{session_name}|#{session_path}' 2>/dev/null \
+        | awk -F'|' -v n="$name" '$1==n{print $2}')
+  [ -z "$dir" ] && { echo "no session '$name'" >&2; return 1; }
+  open -a Cursor "$dir" && echo "opened $dir in Cursor"
+}
+
+cmd_open() {
+  local name="${1:-}"
+  [ -z "$name" ] && name=$(live_name)
+  [ -z "$name" ] && { echo "usage: wt open <session>  (no name given and not inside a wt session)" >&2; exit 1; }
+  it has-session -t "=$name" 2>/dev/null || { echo "no session '$name' (see: wt ls)" >&2; exit 1; }
+  [ -n "$(it list-clients 2>/dev/null)" ] || { echo "no attached client — hub not open" >&2; exit 1; }
+  focus "$name"
+  echo "opened '$name'"
+}
+
+# Fn key → session. F1-F8 peek their session in a popup; pressing again jumps in.
+KEYS="$HOME/.local/state/wt/keys"
+cmd_key() {
+  local k="${1:-}" name="${2:-}" f
+  mkdir -p "$KEYS"
+  if [ -z "$k" ]; then                      # list every binding
+    for f in "$KEYS"/F[1-8]; do
+      [ -f "$f" ] && printf '%-3s %s\n' "$(basename "$f")" "$(cat "$f")"
+    done
+    return 0
+  fi
+  case "$k" in F[1-8]) ;; *) echo "usage: wt key <F1..F8> [session|--clear]" >&2; return 1 ;; esac
+  case "$name" in
+    "") cat "$KEYS/$k" 2>/dev/null || { echo "$k is unassigned" >&2; return 1; } ;;
+    --clear) rm -f "$KEYS/$k"; echo "$k cleared" ;;
+    *)
+      it has-session -t "=$name" 2>/dev/null \
+        || { echo "no session '$name' (see: wt ls)" >&2; return 1; }
+      printf '%s\n' "$name" > "$KEYS/$k"
+      echo "$k → $name" ;;
+  esac
+}
+
+# kept as a thin alias: the orchestrator is simply whatever sits on F2
+cmd_orch() {
+  local a="${1:-}"
+  case "$a" in
+    "") cmd_key F2 ;;
+    --clear) cmd_key F2 --clear ;;
+    *) cmd_key F2 "$a" ;;
+  esac
+}
+
+cmd_tell() {
+  local msg="$*"
+  [ -z "$msg" ] && { echo "usage: wt tell <message>" >&2; exit 1; }
+  local target self
+  target=$(cmd_current) || exit 1
+  self=$(live_name) || self=""
+  if [ -n "$self" ] && [ "$target" = "$self" ]; then
+    echo "user is already viewing '$self' — nothing sent"
+    return 0
+  fi
+  cmd_send "$target" "$msg"
+}
+
+layout_add_after() {  # $1 new · $2 existing — put the new row directly under the old one
+  local n="$1" after="$2"
+  [ -f "$LAYOUT" ] || return 0
+  grep -qx "$after" "$LAYOUT" || return 0
+  grep -qx "$n" "$LAYOUT" && return 0
+  awk -v n="$n" -v a="$after" '{print} $0==a{print n}' "$LAYOUT" > "$LAYOUT.tmp" \
+    && mv "$LAYOUT.tmp" "$LAYOUT"
+}
+
+layout_group_add() {  # $1 session · $2 group — tag a session into a sidebar group
+  local n="$1" g="$2"
+  grep -qx "$n" "$LAYOUT" 2>/dev/null && return   # already placed (or has an old spot)
+  if [ -f "$LAYOUT" ] && grep -qx "\[$g\]" "$LAYOUT"; then
+    awk -v n="$n" -v h="[$g]" '{print} $0==h{print n}' "$LAYOUT" > "$LAYOUT.tmp" \
+      && mv "$LAYOUT.tmp" "$LAYOUT"
+  else
+    printf '[%s]\n%s\n' "$g" "$n" >> "$LAYOUT"
+  fi
+}
+
+cmd_scratch() {
+  local name=scratch attach=0 a
+  for a in "$@"; do
+    case "$a" in --attach) attach=1 ;; *) name="$a" ;; esac
+  done
+  name=$(name_for "$name")
+  local dir="$HOME/.local/state/wt/scratch/$name"   # stable dir keeps claude's history
+  if ! it has-session -t "=$name" 2>/dev/null; then
+    mkdir -p "$dir"
+    it new-session -d -s "$name" -c "$dir" -e WT_SESSION="$name"
+    # key-table is managed by peek-attach.sh while the session is being peeked;
+    # it must stay root here or a fresh scratch would swallow the Fn keys
+    it rename-window -t "=$name:^" claude
+    it send-keys -t "=$name:^" "$DEFAULT_CMD" Enter
+    # first launch in a fresh dir: auto-accept claude's trust-folder dialog
+    ( for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        sleep 1
+        if it capture-pane -t "=$name:^" -p 2>/dev/null | grep -q 'trust this folder'; then
+          it send-keys -t "=$name:^" Enter; break
+        fi
+      done ) >/dev/null 2>&1 &
+    layout_group_add "$name" scratch
+    echo "→ scratch session '$name'"
+  fi
+  if [ "$attach" -eq 1 ]; then   # runs inside the popup (or a plain terminal)
+    exec env TMUX= tmux -L "$SOCK" -f "$CONF/inner.conf" attach -t "=$name"
+  fi
+  # only move the view when we are opening the hub for them anyway; a spawn from
+  # inside the hub must leave the user where they are
+  if [ -z "${TMUX:-}" ]; then focus "$name"; exec "$0" ui; fi
+  return 0
+}
+
+# a browser as a first-class session: same sidebar row, same Fn-key peek, same
+# groups. Carbonyl is Chromium rendered into the pane, so dashboards actually work.
+cmd_browser() {
+  local name="" url="" a
+  for a in "$@"; do
+    case "$a" in
+      http://*|https://*) url="$a" ;;
+      *.com|*.dev|*.io|*.ai|*.org|*.net) url="https://$a" ;;
+      *) [ -z "$name" ] && name="$a" ;;
+    esac
+  done
+  [ -z "$name" ] && name="browser"
+  name=$(name_for "$name")
+  command -v carbonyl >/dev/null || die_browser
+  local dir="$HOME/.local/state/wt/browser/$name"   # stable dir keeps its profile
+  if it has-session -t "=$name" 2>/dev/null; then
+    [ -n "$url" ] && it send-keys -t "=$name:^" C-c \
+      && it send-keys -t "=$name:^" "carbonyl $(printf '%q' "$url")" Enter
+  else
+    mkdir -p "$dir"
+    [ -n "$url" ] && printf '%s\n' "$url" > "$dir/url"
+    [ -z "$url" ] && url=$(cat "$dir/url" 2>/dev/null)
+    [ -z "$url" ] && url="https://www.google.com"
+    it new-session -d -s "$name" -c "$dir" -e WT_SESSION="$name" \
+       "carbonyl $(printf '%q' "$url")"
+    it rename-window -t "=$name:^" browser
+    layout_group_add "$name" browsers
+    echo "→ browser session '$name' → $url"
+  fi
+  # only move the view when we are opening the hub for them anyway; a spawn from
+  # inside the hub must leave the user where they are
+  if [ -z "${TMUX:-}" ]; then focus "$name"; exec "$0" ui; fi
+  return 0
+}
+die_browser() {
+  echo "carbonyl not installed — run: npm install -g carbonyl" >&2; exit 1
+}
+
+cmd_here() {
+  local name="${1:-$(basename "$PWD")}"
+  name=$(name_for "$name")
+  it has-session -t "=$name" 2>/dev/null \
+    || it new-session -d -s "$name" -c "$PWD" -e WT_SESSION="$name"
+  # only move the view when we are opening the hub for them anyway; a spawn from
+  # inside the hub must leave the user where they are
+  if [ -z "${TMUX:-}" ]; then focus "$name"; exec "$0" ui; fi
+  return 0
+}
+
+sub="${1:-ui}"
+[ $# -gt 0 ] && shift
+case "$sub" in
+  ui)   cmd_ui ;;
+  doctor) cmd_doctor "$@" ;;
+  new)  cmd_new "$@" ;;
+  clone) cmd_clone "$@" ;;
+  rm)   cmd_rm "$@" ;;
+  mv)   cmd_mv "$@" ;;
+  ls)   [ "${1:-}" = --json ] && cmd_ls_json || cmd_ls ;;
+  attach-cmd) cmd_attach_cmd "$@" ;;
+  here) cmd_here "$@" ;;
+  browser) cmd_browser "$@" ;;
+  scratch) cmd_scratch "$@" ;;
+  send) cmd_send "$@" ;;
+  peek) cmd_peek "$@" ;;
+  busy) cmd_busy "$@" ;;
+  current) cmd_current ;;
+  orch) cmd_orch "$@" ;;
+  key)  cmd_key "$@" ;;
+  edit) cmd_edit "$@" ;;
+  open) cmd_open "$@" ;;
+  tell) cmd_tell "$@" ;;
+  push|vmsync) exec "$CONF/wt-vm.sh" "$sub" "$@" ;;
+  csetup|cnew|cpush|cpull|crm) exec "$CONF/wt-container.sh" "$sub" "$@" ;;
+  slug) cmd_slug "$@" ;;
+  name) name_for "${1:-}"; echo ;;
+  *)    grep '^#   wt' "$0" | sed 's/^#   //'; exit 1 ;;
+esac
